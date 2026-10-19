@@ -40,7 +40,7 @@ Pass multiple paths after a single `-c` option:
 python extractor.py -c /opt/traefik/acme.json /opt/other-traefik/acme.json -d ./certs
 ```
 
-The output directory passed with `-d` must already exist. All input files must exist and be readable. Each file can independently use either of the supported ACME v1 or v2 formats. `--include` and `--exclude` apply across all sources and retain certificate-level matching against main names and SANs.
+The output directory passed with `-d` must already exist. All input files must exist and be readable. Each file can independently use a legacy ACME v1/v2 format with `Account` at the root, or the Traefik v2/v3 format organized by certificate resolver (for example, `letsencrypt`). All resolvers in a file are read; empty certificate lists and `Certificates: null` are supported. `--include` and `--exclude` apply across all sources and retain certificate-level matching against main names and SANs.
 
 All input files are monitored, including files in different directories and files replaced atomically. After two seconds without a matching change, all sources are read and checked before writing certificates. Extraction starts on file changes, not immediately at startup. Unreadable or malformed inputs abort the batch before writes; monitoring continues so a later update can recover.
 

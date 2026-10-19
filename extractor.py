@@ -112,19 +112,37 @@ def readCerts(source, args):
     except (OSError, ValueError) as error:
         raise ValueError('Unable to read ' + source + ': ' + str(error)) from error
 
-    # Determine ACME version
-    acme_version = 2 if 'acme-v02' in data['Account']['Registration']['uri'] else 1
-
-    # Find certificates
-    if acme_version == 1:
-        certs = data['DomainsCertificate']['Certs']
-    elif acme_version == 2:
-        certs = data['Certificates']
+    if not isinstance(data, dict):
+        raise ValueError('ACME storage must be a JSON object')
+    resolver_format = 'Account' not in data
+    acme_version = 2
+    if resolver_format:
+        certs = []
+        for resolver, storage in data.items():
+            if not isinstance(storage, dict) or 'Certificates' not in storage:
+                raise ValueError('Invalid ACME storage for resolver ' + resolver)
+            resolver_certs = storage['Certificates']
+            if resolver_certs is None:
+                continue
+            if not isinstance(resolver_certs, list):
+                raise ValueError('Certificates must be a list for resolver ' + resolver)
+            certs.extend(resolver_certs)
+    else:
+        acme_version = 2 if 'acme-v02' in data['Account']['Registration']['uri'] else 1
+        if acme_version == 1:
+            certs = data['DomainsCertificate']['Certs']
+        else:
+            certs = data['Certificates']
 
     records = []
 
     for c in certs:
-        if acme_version == 1:
+        if resolver_format:
+            name = c['domain']['main']
+            privatekey = c['key']
+            fullchain = c['certificate']
+            sans = c['domain'].get('sans')
+        elif acme_version == 1:
             name = c['Certificate']['Domain']
             privatekey = c['Certificate']['PrivateKey']
             fullchain = c['Certificate']['Certificate']

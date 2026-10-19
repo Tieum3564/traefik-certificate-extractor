@@ -37,7 +37,7 @@ class ExtractionTests(unittest.TestCase):
         self.addCleanup(self.stdout.__exit__, None, None, None)
         self.addCleanup(self.stderr.__exit__, None, None, None)
 
-    def source(self, filename, domains, version=2):
+    def source(self, filename, domains, version=2, resolver=None):
         fullchain = ('-----BEGIN CERTIFICATE-----\nleaf\n-----END CERTIFICATE-----\n'
                      '-----BEGIN CERTIFICATE-----\nchain\n-----END CERTIFICATE-----\n')
         encoded = b64encode(fullchain.encode()).decode()
@@ -56,11 +56,58 @@ class ExtractionTests(unittest.TestCase):
             data['Certificates'] = certificates
         else:
             data['DomainsCertificate'] = {'Certs': certificates}
+        if resolver is not None:
+            data['Certificates'] = [
+                {'domain': {'main': certificate['Domain']['Main'],
+                            'sans': certificate['Domain']['SANs']},
+                 'key': certificate['Key'], 'certificate': certificate['Certificate']}
+                for certificate in certificates]
+            data = {resolver: data}
         path = self.root / filename
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(data))
         self.args.certificate.append(str(path))
         return path
+
+    def test_resolver_format_extracts_main_and_sans(self):
+        self.source('modern.json', [('first.test', ['alias.test'])], resolver='letsencrypt')
+        self.args.flat = True
+        self.assertEqual(extractor.createCerts(self.args), ['first.test', 'alias.test'])
+        for name in ['first.test', 'alias.test']:
+            self.assertEqual((self.output / (name + '.key')).read_text(), 'private key')
+            self.assertIn('leaf', (self.output / (name + '.crt')).read_text())
+            self.assertNotIn('leaf', (self.output / (name + '.chain.pem')).read_text())
+
+    def test_multiple_resolvers_and_legacy_sources(self):
+        first = self.source('modern.json', [('first.test', None)], resolver='letsencrypt')
+        second = self.source('second.json', [('second.test', [])], resolver='other')
+        data = json.loads(first.read_text())
+        data.update(json.loads(second.read_text()))
+        data['unused'] = {'Account': {}, 'Certificates': None}
+        del data['letsencrypt']['Certificates'][0]['domain']['sans']
+        first.write_text(json.dumps(data))
+        self.args.certificate.remove(str(second))
+        self.source('legacy.json', [('legacy.test', [])], version=1)
+        self.assertEqual(extractor.createCerts(self.args),
+                         ['first.test', 'second.test', 'legacy.test'])
+
+    def test_resolver_format_preserves_filters(self):
+        self.source('modern.json', [('first.test', ['alias.test']), ('second.test', [])],
+                    resolver='letsencrypt')
+        self.args.include = ['alias.test']
+        self.assertEqual(extractor.createCerts(self.args), ['first.test'])
+        self.args.include = None
+        self.args.exclude = ['alias.test']
+        self.assertEqual(extractor.createCerts(self.args), ['second.test'])
+
+    def test_invalid_resolver_aborts_before_writes(self):
+        source = self.source('modern.json', [('first.test', [])], resolver='letsencrypt')
+        data = json.loads(source.read_text())
+        data['broken'] = {'Certificates': 'invalid'}
+        source.write_text(json.dumps(data))
+        with self.assertRaisesRegex(ValueError, 'broken'):
+            extractor.createCerts(self.args)
+        self.assertFalse(self.output.exists())
 
     def test_mixed_versions_and_duplicate_input(self):
         first = self.source('first/acme.json', [('first.test', None)], version=1)
