@@ -48,6 +48,20 @@ If multiple sources would write the same domain, an error lists the domain and s
 
 `--dry-run` checks every input and reports conflicts without writing files or restarting containers. With `-r`, each matching container is restarted at most once per successful batch; skipped domains do not trigger restarts.
 
+## Logs
+
+Application logs are written immediately to stderr, one message per line, with a human-readable local date, UTC offset and severity level. Docker captures these messages without requiring unbuffered Python output.
+
+```text
+2026-10-19 14:30:00+0200 [INFO] Starting certificate extraction
+2026-10-19 14:30:00+0200 [INFO] Reading ACME file: /app/data/acme.json
+2026-10-19 14:30:00+0200 [INFO] Selected 1 certificate(s) from /app/data/acme.json
+2026-10-19 14:30:00+0200 [INFO] Extracted certificate for: example.com (output: /app/certs/example.com)
+2026-10-19 14:30:00+0200 [INFO] Certificate extraction finished: 1 domain(s) extracted in 0.012s
+```
+
+Logs also report watched paths, output settings, file changes, container restarts and extraction errors. Dry runs are explicitly marked. Certificate contents and private keys are never logged. The timezone follows the runtime environment, which may default to UTC inside Docker.
+
 ## Docker
 Docker Hub image name: [tymat3564/certsextractor](https://hub.docker.com/r/tymat3564/certsextractor/).
 Example run:

@@ -3,6 +3,7 @@ import os
 import errno
 import time
 import json
+import logging
 import docker
 import threading
 import argparse
@@ -11,6 +12,19 @@ from base64 import b64decode
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 from pathlib import Path
+
+
+logger = logging.getLogger(__name__)
+
+
+def configureLogging(stream=None):
+    handler = logging.StreamHandler(stream)
+    handler.setFormatter(logging.Formatter(
+        '%(asctime)s [%(levelname)s] %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S%z'))
+    logger.handlers[:] = [handler]
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
 
 
 class PathType(object):
@@ -80,8 +94,10 @@ def restartContainerWithDomains(domains):
     for c in container:
         restartDomains = str.split(c.labels["com.github.SnowMB.traefik-certificate-extractor.restart_domain"], ',')
         if not set(domains).isdisjoint(restartDomains):
-            print('restarting container ' + c.id)
+            logger.info('Restarting container %s for domains: %s',
+                        c.id, ', '.join(sorted(set(domains).intersection(restartDomains))))
             c.restart()
+            logger.info('Container %s restarted', c.id)
 
 
 def certificatePaths(certificate):
@@ -141,10 +157,12 @@ def createCerts(args):
     records = []
     owners = {}
     for source in certificatePaths(args.certificate):
+        logger.info('Reading ACME file: %s', source)
         try:
             source_records = readCerts(source, args)
         except (KeyError, TypeError, ValueError) as error:
             raise ValueError('Unable to extract from ' + source + ': ' + str(error)) from error
+        logger.info('Selected %d certificate(s) from %s', len(source_records), source)
         for record in source_records:
             for name in record[0]:
                 owners.setdefault(name, set()).add(source)
@@ -152,10 +170,9 @@ def createCerts(args):
 
     conflicts = {name for name, sources in owners.items() if len(sources) > 1}
     for name in sorted(conflicts):
-        print('ERROR: Conflicting certificates for ' + name + ' in ' +
-              ', '.join(sorted(owners[name])) +
-              '; skipping this domain. Existing output is unchanged and may be stale.',
-              file=sys.stderr)
+        logger.error('Conflicting certificates for %s in %s; skipping this domain. '
+                     'Existing output is unchanged and may be stale.',
+                     name, ', '.join(sorted(owners[name])))
 
     names = []
     for targets, privatekey, cert, chain, fullchain in records:
@@ -174,8 +191,9 @@ def createCerts(args):
                 directory.mkdir(parents=True, exist_ok=True)
                 for filename, content in files.items():
                     (directory / filename).write_text(content)
-            print(('Would extract certificate for: ' if args.dry else
-                   'Extracted certificate for: ') + name)
+            logger.info('%s certificate for: %s (output: %s)',
+                        'Would extract' if args.dry else 'Extracted',
+                        name, args.directory if args.flat else str(Path(args.directory) / name))
             names.append(name)
     return list(dict.fromkeys(names))
 
@@ -217,7 +235,8 @@ class Handler(FileSystemEventHandler):
         if not event.is_directory and any(
                 path and os.path.abspath(os.fsdecode(path)) in self.paths
                 for path in event_paths):
-            print('Certificates changed')
+            logger.info('Certificate file changed (%s): %s', event.event_type,
+                        ' -> '.join(path for path in event_paths if path))
 
             with self.lock:
                 self.generation += 1
@@ -234,14 +253,20 @@ class Handler(FileSystemEventHandler):
                     return
                 self.timer = None
 
-            print('DEBUG : starting the work')
+            started = time.monotonic()
+            logger.info('Starting certificate extraction%s',
+                        ' (dry run)' if self.args.dry else '')
             try:
                 domains = createCerts(self.args)
                 if domains and self.args.restart_container and not self.args.dry:
                     restartContainerWithDomains(domains)
             except (OSError, ValueError) as error:
-                print('Unable to extract certificates: ' + str(error), file=sys.stderr)
-            print('DEBUG : finished')
+                logger.error('Unable to extract certificates: %s (elapsed: %.3fs)',
+                             error, time.monotonic() - started)
+                return
+            logger.info('Certificate extraction finished: %d domain(s) %s in %.3fs',
+                        len(domains), 'selected (dry run)' if self.args.dry else 'extracted',
+                        time.monotonic() - started)
 
 
 def parseArgs(argv=None):
@@ -272,10 +297,12 @@ def parseArgs(argv=None):
 
 
 if __name__ == "__main__":
+    configureLogging()
     args = parseArgs()
 
-    print('DEBUG: watching path: ' + str(args.certificate))
-    print('DEBUG: output path: ' + str(args.directory))
+    logger.info('Watching ACME files: %s', ', '.join(args.certificate))
+    logger.info('Output directory: %s (flat: %s, dry run: %s, container restart: %s)',
+                args.directory, args.flat, args.dry, args.restart_container)
 
     # Create event handler and observer
     event_handler = Handler(args)
@@ -293,3 +320,4 @@ if __name__ == "__main__":
         observer.stop()
     observer.join()
     event_handler.close()
+    logger.info('Certificate monitoring stopped')

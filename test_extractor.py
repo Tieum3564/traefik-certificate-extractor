@@ -1,6 +1,7 @@
 import argparse
 from base64 import b64encode
 from contextlib import redirect_stderr, redirect_stdout
+from datetime import datetime
 import io
 import json
 from pathlib import Path
@@ -25,6 +26,10 @@ class ExtractionTests(unittest.TestCase):
                                        exclude=None, restart_container=False)
         self.log = io.StringIO()
         self.errors = io.StringIO()
+        logging_handlers = patch.object(extractor.logger, 'handlers', [])
+        logging_handlers.start()
+        self.addCleanup(logging_handlers.stop)
+        extractor.configureLogging(self.log)
         self.stdout = redirect_stdout(self.log)
         self.stderr = redirect_stderr(self.errors)
         self.stdout.__enter__()
@@ -72,9 +77,9 @@ class ExtractionTests(unittest.TestCase):
         self.source('second.json', [('shared.test', []), ('second.test', [])])
         self.assertEqual(extractor.createCerts(self.args), ['first.test', 'second.test'])
         self.assertFalse((self.output / 'shared.test').exists())
-        self.assertIn('shared.test', self.errors.getvalue())
-        self.assertIn('first.json', self.errors.getvalue())
-        self.assertIn('second.json', self.errors.getvalue())
+        self.assertIn('[ERROR] Conflicting certificates for shared.test', self.log.getvalue())
+        self.assertIn('first.json', self.log.getvalue())
+        self.assertIn('second.json', self.log.getvalue())
 
     def test_flat_conflict_skips_only_shared_san(self):
         self.source('first.json', [('first.test', ['shared.test', 'first.test'])])
@@ -89,7 +94,39 @@ class ExtractionTests(unittest.TestCase):
         self.source('first.json', [('first.test', ['shared.test'])])
         self.source('second.json', [('second.test', ['shared.test'])])
         self.assertEqual(extractor.createCerts(self.args), ['first.test', 'second.test'])
-        self.assertEqual(self.errors.getvalue(), '')
+        self.assertNotIn('[ERROR]', self.log.getvalue())
+
+    def test_extraction_logs_are_timestamped_and_line_separated(self):
+        source = self.source('first.json', [('first.test', []), ('second.test', [])])
+        handler = extractor.Handler(self.args)
+        self.addCleanup(handler.close)
+        handler.doTheWork(0)
+        lines = self.log.getvalue().splitlines()
+        self.assertEqual(len(lines), 6)
+        for line in lines:
+            with self.subTest(line=line):
+                datetime.strptime(line[:24], '%Y-%m-%d %H:%M:%S%z')
+                self.assertEqual(line[24:32], ' [INFO] ')
+        self.assertIn('Starting certificate extraction', lines[0])
+        self.assertIn(str(source), lines[1])
+        self.assertIn('Selected 2 certificate(s)', lines[2])
+        self.assertIn('Extracted certificate for: first.test', lines[3])
+        self.assertIn(str(self.output / 'first.test'), lines[3])
+        self.assertIn('Extracted certificate for: second.test', lines[4])
+        self.assertRegex(lines[5], r'finished: 2 domain\(s\) extracted in \d+\.\d{3}s$')
+        self.assertNotIn('private key', self.log.getvalue())
+
+    def test_failed_extraction_logs_error_without_success_summary(self):
+        source = self.source('broken.json', [])
+        source.write_text('{')
+        handler = extractor.Handler(self.args)
+        self.addCleanup(handler.close)
+        handler.doTheWork(0)
+        lines = self.log.getvalue().splitlines()
+        datetime.strptime(lines[-1][:24], '%Y-%m-%d %H:%M:%S%z')
+        self.assertIn('[ERROR] Unable to extract certificates:', lines[-1])
+        self.assertIn(str(source), lines[-1])
+        self.assertNotIn('extraction finished', self.log.getvalue())
 
     def test_conflict_preserves_existing_output(self):
         self.source('first.json', [('shared.test', [])])
@@ -99,7 +136,7 @@ class ExtractionTests(unittest.TestCase):
         self.source('second.json', [('shared.test', [])])
         self.assertEqual(extractor.createCerts(self.args), [])
         self.assertEqual(certificate.read_text(), 'existing certificate')
-        self.assertIn('stale', self.errors.getvalue())
+        self.assertIn('stale', self.log.getvalue())
 
     def test_filters_remain_certificate_scoped(self):
         self.source('first.json', [('first.test', ['included.test'])])
@@ -115,6 +152,7 @@ class ExtractionTests(unittest.TestCase):
         self.args.dry = True
         self.assertEqual(extractor.createCerts(self.args), ['first.test'])
         self.assertFalse(self.output.exists())
+        self.assertIn('Would extract certificate for: first.test', self.log.getvalue())
 
     def test_invalid_input_aborts_before_writes(self):
         self.source('first.json', [('first.test', [])])
