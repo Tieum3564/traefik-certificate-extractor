@@ -1,2 +1,2 @@
-watchdog3
+watchdog
 docker

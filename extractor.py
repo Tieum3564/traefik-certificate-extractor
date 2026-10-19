@@ -81,13 +81,20 @@ def restartContainerWithDomains(domains):
         restartDomains = str.split(c.labels["com.github.SnowMB.traefik-certificate-extractor.restart_domain"], ',')
         if not set(domains).isdisjoint(restartDomains):
             print('restarting container ' + c.id)
-            if not args.dry:
-                c.restart()
+            c.restart()
 
 
-def createCerts(args):
-    # Read JSON file
-    data = json.loads(open(args.certificate).read())
+def certificatePaths(certificate):
+    paths = [certificate] if isinstance(certificate, (str, Path)) else certificate
+    return list(dict.fromkeys(os.path.abspath(path) for path in paths))
+
+
+def readCerts(source, args):
+    try:
+        with open(source) as source_file:
+            data = json.load(source_file)
+    except (OSError, ValueError) as error:
+        raise ValueError('Unable to read ' + source + ': ' + str(error)) from error
 
     # Determine ACME version
     acme_version = 2 if 'acme-v02' in data['Account']['Registration']['uri'] else 1
@@ -98,8 +105,7 @@ def createCerts(args):
     elif acme_version == 2:
         certs = data['Certificates']
 
-    # Loop over all certificates
-    names = []
+    records = []
 
     for c in certs:
         if acme_version == 1:
@@ -113,7 +119,10 @@ def createCerts(args):
             fullchain = c['Certificate']
             sans = c['Domain']['SANs']
 
-        if (args.include and name not in args.include) or (args.exclude and name in args.exclude):
+        certificate_domains = [name] + (sans or [])
+        if args.include and not any(domain in args.include for domain in certificate_domains):
+            continue
+        if args.exclude and any(domain in args.exclude for domain in certificate_domains):
             continue
 
         # Decode private key, certificate and chain
@@ -123,60 +132,76 @@ def createCerts(args):
         cert = fullchain[0:start]
         chain = fullchain[start:]
 
-        if not args.dry:
-            # Create domain     directory if it doesn't exist
-            directory = Path(args.directory)
-            if not directory.exists():
-                directory.mkdir()
+        targets = list(dict.fromkeys(certificate_domains if args.flat else [name]))
+        records.append((targets, privatekey, cert, chain, fullchain))
+    return records
 
-            if args.flat:
-                # Write private key, certificate and chain to flat files
-                with (directory / name + '.key').open('w') as f:
-                    f.write(privatekey)
-                with (directory / name + '.crt').open('w') as f:
-                    f.write(fullchain)
-                with (directory / name + '.chain.pem').open('w') as f:
-                    f.write(chain)
 
-                if sans:
-                    for name in sans:
-                        with (directory / name + '.key').open('w') as f:
-                            f.write(privatekey)
-                        with (directory / name + '.crt').open('w') as f:
-                            f.write(fullchain)
-                        with (directory / name + '.chain.pem').open('w') as f:
-                            f.write(chain)
-            else:
-                directory = directory / name
-                if not directory.exists():
-                    directory.mkdir()
+def createCerts(args):
+    records = []
+    owners = {}
+    for source in certificatePaths(args.certificate):
+        try:
+            source_records = readCerts(source, args)
+        except (KeyError, TypeError, ValueError) as error:
+            raise ValueError('Unable to extract from ' + source + ': ' + str(error)) from error
+        for record in source_records:
+            for name in record[0]:
+                owners.setdefault(name, set()).add(source)
+            records.append(record)
 
-                # Write private key, certificate and chain to file
-                with (directory / 'privkey.pem').open('w') as f:
-                    f.write(privatekey)
+    conflicts = {name for name, sources in owners.items() if len(sources) > 1}
+    for name in sorted(conflicts):
+        print('ERROR: Conflicting certificates for ' + name + ' in ' +
+              ', '.join(sorted(owners[name])) +
+              '; skipping this domain. Existing output is unchanged and may be stale.',
+              file=sys.stderr)
 
-                with (directory / 'cert.pem').open('w') as f:
-                    f.write(cert)
-
-                with (directory / 'chain.pem').open('w') as f:
-                    f.write(chain)
-
-                with (directory / 'fullchain.pem').open('w') as f:
-                    f.write(fullchain)
-
-        print('Extracted certificate for: ' + name +
-              (', ' + ', '.join(sans) if sans else ''))
-        names.append(name)
-    return names
+    names = []
+    for targets, privatekey, cert, chain, fullchain in records:
+        for name in targets:
+            if name in conflicts:
+                continue
+            if not args.dry:
+                directory = Path(args.directory)
+                if args.flat:
+                    files = {name + '.key': privatekey, name + '.crt': fullchain,
+                             name + '.chain.pem': chain}
+                else:
+                    directory = directory / name
+                    files = {'privkey.pem': privatekey, 'cert.pem': cert,
+                             'chain.pem': chain, 'fullchain.pem': fullchain}
+                directory.mkdir(parents=True, exist_ok=True)
+                for filename, content in files.items():
+                    (directory / filename).write_text(content)
+            print(('Would extract certificate for: ' if args.dry else
+                   'Extracted certificate for: ') + name)
+            names.append(name)
+    return list(dict.fromkeys(names))
 
 
 class Handler(FileSystemEventHandler):
 
     def __init__(self, args):
         self.args = args
-        self.isWaiting = False
-        self.timer = threading.Timer(0.5, self.doTheWork)
+        self.paths = set(certificatePaths(args.certificate))
+        self.timer = None
+        self.generation = 0
         self.lock = threading.Lock()
+        self.work_lock = threading.Lock()
+
+    def watch(self, observer):
+        for directory in sorted({str(Path(path).parent) for path in self.paths}):
+            observer.schedule(self, directory)
+
+    def close(self):
+        with self.lock:
+            self.generation += 1
+            if self.timer is not None:
+                self.timer.cancel()
+                self.timer = None
+        with self.work_lock:
+            pass
 
     def on_created(self, event):
         self.handle(event)
@@ -184,34 +209,46 @@ class Handler(FileSystemEventHandler):
     def on_modified(self, event):
         self.handle(event)
 
+    def on_moved(self, event):
+        self.handle(event)
+
     def handle(self, event):
-        # Check if it's a JSON file
-        print('DEBUG : event fired')
-        if not event.is_directory and event.src_path.endswith(str(self.args.certificate)):
+        event_paths = [event.src_path, getattr(event, 'dest_path', '')]
+        if not event.is_directory and any(
+                path and os.path.abspath(os.fsdecode(path)) in self.paths
+                for path in event_paths):
             print('Certificates changed')
 
             with self.lock:
-                if not self.isWaiting:
-                    self.isWaiting = True #trigger the work just once (multiple events get fired)
-                    self.timer = threading.Timer(2, self.doTheWork)
-                    self.timer.start()
+                self.generation += 1
+                generation = self.generation
+                if self.timer is not None:
+                    self.timer.cancel()
+                self.timer = threading.Timer(2, self.doTheWork, args=(generation,))
+                self.timer.start()
 
-    def doTheWork(self):
-        print('DEBUG : starting the work')
-        domains = createCerts(self.args)
-        if (self.args.restart_container):
-            restartContainerWithDomains(domains)
+    def doTheWork(self, generation):
+        with self.work_lock:
+            with self.lock:
+                if generation != self.generation:
+                    return
+                self.timer = None
 
-        with self.lock:
-            self.isWaiting = False
-        print('DEBUG : finished')
+            print('DEBUG : starting the work')
+            try:
+                domains = createCerts(self.args)
+                if domains and self.args.restart_container and not self.args.dry:
+                    restartContainerWithDomains(domains)
+            except (OSError, ValueError) as error:
+                print('Unable to extract certificates: ' + str(error), file=sys.stderr)
+            print('DEBUG : finished')
 
 
-if __name__ == "__main__":
+def parseArgs(argv=None):
     parser = argparse.ArgumentParser(
         description='Extract traefik letsencrypt certificates.')
-    parser.add_argument('-c', '--certificate', default='acme.json', type=PathType(
-        exists=True), help='file that contains the traefik certificates (default acme.json)')
+    parser.add_argument('-c', '--certificate', nargs='+', type=PathType(
+        exists=True, dash_ok=False), help='ACME files to watch (default ACME_FILE or acme.json)')
     parser.add_argument('-d', '--directory', default='.',
                         type=PathType(type='dir'), help='output folder')
     parser.add_argument('-f', '--flat', action='store_true',
@@ -224,7 +261,18 @@ if __name__ == "__main__":
     group.add_argument('--include', nargs='*')
     group.add_argument('--exclude', nargs='*')
 
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
+    if args.certificate is None:
+        try:
+            args.certificate = [PathType(dash_ok=False)(os.environ.get('ACME_FILE', 'acme.json'))]
+        except err as error:
+            parser.error(str(error))
+    args.certificate = certificatePaths(args.certificate)
+    return args
+
+
+if __name__ == "__main__":
+    args = parseArgs()
 
     print('DEBUG: watching path: ' + str(args.certificate))
     print('DEBUG: output path: ' + str(args.directory))
@@ -234,7 +282,7 @@ if __name__ == "__main__":
     observer = Observer()
 
     # Register the directory to watch
-    observer.schedule(event_handler, str(Path(args.certificate).parent))
+    event_handler.watch(observer)
 
     # Main loop to watch the directory
     observer.start()
@@ -244,3 +292,4 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         observer.stop()
     observer.join()
+    event_handler.close()

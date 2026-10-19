@@ -1,0 +1,37 @@
+services:
+  extractor:
+    build:
+      context: ..
+    image: tymat3564/certsextractor:latest
+    restart: unless-stopped
+    command:
+      - --certificate
+      - /app/source-one/${ACME_ONE_FILE:-acme.json}
+      - /app/source-two/${ACME_TWO_FILE:-acme.json}
+      - -r
+      - --include
+      - example.com
+      - example.org
+    volumes:
+      - type: bind
+        source: ${ACME_ONE_DIR:?Set ACME_ONE_DIR to the first ACME directory}
+        target: /app/source-one
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${ACME_TWO_DIR:?Set ACME_TWO_DIR to the second ACME directory}
+        target: /app/source-two
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${CERTIFICATES_DIR:?Set CERTIFICATES_DIR to the output directory}
+        target: /app/certs
+        bind:
+          create_host_path: false
+      - type: bind
+        source: /var/run/docker.sock
+        target: /var/run/docker.sock
+        bind:
+          create_host_path: false
